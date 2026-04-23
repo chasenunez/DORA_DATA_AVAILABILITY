@@ -28,9 +28,17 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
+import io
+
 import httpx
 from bs4 import BeautifulSoup
 from lxml import etree
+
+try:
+    from pypdf import PdfReader
+    _HAS_PDF = True
+except ImportError:
+    _HAS_PDF = False
 
 # =============================== CONFIG ===============================
 EMAIL = "chase.nunez@lib4ri.ch"
@@ -350,43 +358,115 @@ async def tier2_unpaywall_html(client: httpx.AsyncClient, conn, doi: str) -> Opt
         return None
 
     best = data.get("best_oa_location") or {}
-    candidates = [u for u in (best.get("url_for_landing_page"), best.get("url")) if u]
-    # Also try any oa_locations with HTML URLs
+    # Build ordered, de-duplicated candidate list. HTML landing pages first,
+    # then PDF URLs (parsed in-process if pypdf is available).
+    html_candidates, pdf_candidates = [], []
+    def _add(url, is_pdf):
+        if not url: return
+        tgt = pdf_candidates if is_pdf else html_candidates
+        if url not in tgt:
+            tgt.append(url)
+    _add(best.get("url_for_landing_page"), False)
+    _add(best.get("url"), False)
+    _add(best.get("url_for_pdf"), True)
     for loc in data.get("oa_locations") or []:
-        if loc.get("url") and loc["url"] not in candidates:
-            candidates.append(loc["url"])
+        _add(loc.get("url_for_landing_page"), False)
+        _add(loc.get("url"), False)
+        _add(loc.get("url_for_pdf"), True)
 
-    for url in candidates[:3]:  # cap attempts
-        html_key = f"html|{url}"
-        cached_html = cache_get(conn, "unpaywall", html_key)
-        if cached_html:
-            status, ctype, body = cached_html
-        else:
-            try:
-                r = await fetch(client, url, accept="text/html,application/xml;q=0.9")
-            except Exception as e:
-                cache_put(conn, "unpaywall", html_key, 0, "", b"")
-                continue
-            status, ctype, body = r.status_code, r.headers.get("content-type", ""), r.content
-            cache_put(conn, "unpaywall", html_key, status, ctype, body)
-
-        if status != 200 or not body:
-            continue
-        if "pdf" in (ctype or "").lower():
-            # PDFs deferred to Tier 3 deep mode.
-            continue
-
-        das_text = extract_das_from_html(body)
-        if das_text:
-            return Result(
-                doi=doi, has_das=True, das_text=das_text,
-                data_identifiers=extract_identifiers(das_text, exclude_doi=doi),
-                source="unpaywall_html",
-                confidence="medium",
-                retrieved_at=datetime.now(timezone.utc).isoformat(),
-                notes=f"from {url}",
-            )
+    # Try HTML first, cap attempts for politeness
+    for url in html_candidates[:3]:
+        result = await _fetch_and_extract(client, conn, doi, url, expect_pdf=False)
+        if result:
+            return result
+    # Then PDF
+    for url in pdf_candidates[:2]:
+        result = await _fetch_and_extract(client, conn, doi, url, expect_pdf=True)
+        if result:
+            return result
     return None
+
+async def _fetch_and_extract(client, conn, doi: str, url: str, *, expect_pdf: bool) -> Optional[Result]:
+    cache_key = f"{'pdf' if expect_pdf else 'html'}|{url}"
+    cached = cache_get(conn, "unpaywall", cache_key)
+    if cached:
+        status, ctype, body = cached
+    else:
+        try:
+            accept = "application/pdf" if expect_pdf else "text/html,application/xml;q=0.9"
+            r = await fetch(client, url, accept=accept)
+        except Exception:
+            cache_put(conn, "unpaywall", cache_key, 0, "", b"")
+            return None
+        status, ctype, body = r.status_code, r.headers.get("content-type", ""), r.content
+        cache_put(conn, "unpaywall", cache_key, status, ctype, body)
+
+    if status != 200 or not body:
+        return None
+
+    ctype_l = (ctype or "").lower()
+    is_pdf = "pdf" in ctype_l or body[:4] == b"%PDF"
+
+    if is_pdf:
+        if not _HAS_PDF:
+            return None
+        das_text = extract_das_from_pdf(body)
+        source_tag = "unpaywall_pdf"
+    else:
+        das_text = extract_das_from_html(body)
+        source_tag = "unpaywall_html"
+
+    if das_text:
+        return Result(
+            doi=doi, has_das=True, das_text=das_text,
+            data_identifiers=extract_identifiers(das_text, exclude_doi=doi),
+            source=source_tag,
+            confidence="medium",
+            retrieved_at=datetime.now(timezone.utc).isoformat(),
+            notes=f"from {url}",
+        )
+    return None
+
+def extract_das_from_pdf(body: bytes) -> str:
+    try:
+        reader = PdfReader(io.BytesIO(body))
+    except Exception:
+        return ""
+    # Concatenate all pages' text
+    pages = []
+    for p in reader.pages:
+        try:
+            pages.append(p.extract_text() or "")
+        except Exception:
+            continue
+    text = "\n".join(pages)
+    return extract_das_from_plaintext(text)
+
+def extract_das_from_plaintext(text: str) -> str:
+    """Heuristic: locate a DAS heading; capture ~600 chars following, trimmed
+    at the next plausible section heading."""
+    if not text:
+        return ""
+    # Normalize whitespace within each line but keep line breaks as anchors
+    lines = [re.sub(r'[ \t]+', ' ', ln).strip() for ln in text.splitlines()]
+    joined = "\n".join(lines)
+    m = DAS_HEADING_RE.search(joined)
+    if not m:
+        return ""
+    start = m.end()
+    window = joined[start:start + 2000]
+    # stop at the next ALL-CAPS / Title Case heading or common subsequent section names
+    stop = re.search(
+        r'\n\s*(?:[A-Z][A-Z ]{3,}\n'             # ALL CAPS heading
+        r'|(?:Acknowledg|Fund|Conflict|Reference|Author\s+contrib|'
+        r'Supplement|Competing\s+interest|Abbreviations|Ethics)\b)',
+        window,
+    )
+    if stop:
+        window = window[:stop.start()]
+    # Drop leading colon/period/whitespace
+    window = window.lstrip(" :.\u2013\u2014-\n\t")
+    return re.sub(r'\s+', ' ', window).strip()
 
 def extract_das_from_html(body: bytes) -> str:
     """Heuristic extraction: find a heading matching DAS and return the text

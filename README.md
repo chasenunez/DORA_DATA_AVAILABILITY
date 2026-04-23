@@ -191,10 +191,9 @@ Some things i found out along the way:
 - **"No DAS found" is not the same as "no data shared."** Some disciplines
   have a long tradition of depositing data in community archives without
   ever writing a dedicated DAS (crystallography at the CCDC, for example).
-  A zero in `has_das` should be read as "no statement we could find in the
-  article," not as a moral judgment.
+  A zero in `has_das` smeans "no statement we could find in the
+  article"
 - **The tool is heuristic.** Data availability sections are written by
   humans, formatted by publishers, and rendered by websites in wildly
   inconsistent ways. The extractor is a compromise between recall and
-  precision. When comparing institutes, treat small differences with
-  appropriate humility; treat large differences as genuinely informative.
+  precision.

@@ -511,6 +511,16 @@ def extract_das_from_html(body: bytes) -> str:
         if DAS_HEADING_RE.search(label):
             return _clean_html_text(sec)
 
+    # Pass 4: flatten to plaintext and scan for DAS heading
+    try:
+        flat = soup.get_text("\n", strip=True)
+    except Exception:
+        flat = ""
+    if flat:
+        das = extract_das_from_plaintext(flat)
+        if das and len(das) > 20:
+            return das
+
     return ""
 
 def _clean_html_text(el) -> str:
@@ -518,16 +528,228 @@ def _clean_html_text(el) -> str:
     return re.sub(r'\s+', ' ', txt).strip()
 
 # -------------------- Tier 3: publisher-specific ----------------------
-# Off by default; wire in more adapters as needed when DEEP_SEARCH=True.
+# Off by default. When DEEP_SEARCH=True, tries Crossref TDM, OpenAlex,
+# publisher-specific JATS-XML endpoints, and landing-page meta tag parsing.
 
-async def tier3_publisher(client: httpx.AsyncClient, conn, doi: str) -> Optional[Result]:
+CROSSREF_API = "https://api.crossref.org/works/{doi}"
+OPENALEX_API = "https://api.openalex.org/works/doi:{doi}"
+
+async def tier3_deep(client: httpx.AsyncClient, conn, doi: str) -> Optional[Result]:
     if not DEEP_SEARCH:
         return None
-    prefix = doi.split("/", 1)[0]
-    # Hooks for expansion: PLOS, MDPI, eLife, Frontiers, Springer, Wiley
-    # Each adapter: resolve landing page URL, fetch, parse XML/HTML.
-    # Deliberately minimal in the pilot.
+    for adapter in (t3_crossref_tdm, t3_openalex, t3_publisher_specific, t3_landing_page_meta):
+        try:
+            r = await adapter(client, conn, doi)
+            if r and r.has_das and r.das_text:
+                return r
+        except Exception:
+            continue
     return None
+
+async def t3_crossref_tdm(client, conn, doi: str) -> Optional[Result]:
+    cache_key = f"crossref|{doi}"
+    cached = cache_get(conn, "tier3", cache_key)
+    if cached:
+        status, _, body = cached
+        data = json.loads(body) if status == 200 and body else None
+    else:
+        r = await fetch(client, CROSSREF_API.format(doi=quote(doi, safe="/")))
+        data = r.json() if r.status_code == 200 else None
+        cache_put(conn, "tier3", cache_key, r.status_code,
+                  "application/json", json.dumps(data).encode() if data else b"")
+    if not data:
+        return None
+
+    msg = data.get("message") or {}
+    # TDM link candidates: prefer XML content-type
+    links = msg.get("link") or []
+    links.sort(key=lambda l: 0 if "xml" in (l.get("content-type") or "").lower() else 1)
+
+    for link in links[:4]:
+        url = link.get("URL")
+        if not url:
+            continue
+        is_pdf = "pdf" in (link.get("content-type") or "").lower() or url.lower().endswith(".pdf")
+        result = await _fetch_and_extract(client, conn, doi, url, expect_pdf=is_pdf)
+        if result:
+            result.source = "crossref_tdm"
+            result.confidence = "medium"
+            return result
+    return None
+
+async def t3_openalex(client, conn, doi: str) -> Optional[Result]:
+    cache_key = f"openalex|{doi}"
+    cached = cache_get(conn, "tier3", cache_key)
+    if cached:
+        status, _, body = cached
+        data = json.loads(body) if status == 200 and body else None
+    else:
+        r = await fetch(client, OPENALEX_API.format(doi=quote(doi, safe="/")),
+                        params={"mailto": EMAIL})
+        data = r.json() if r.status_code == 200 else None
+        cache_put(conn, "tier3", cache_key, r.status_code,
+                  "application/json", json.dumps(data).encode() if data else b"")
+    if not data:
+        return None
+
+    oa_urls = []
+    for loc in [data.get("primary_location"), data.get("best_oa_location")] + (data.get("locations") or []):
+        if not loc: continue
+        for key, is_pdf in (("pdf_url", True), ("landing_page_url", False)):
+            if loc.get(key):
+                oa_urls.append((loc[key], is_pdf))
+    # de-dup while preserving order
+    seen, ordered = set(), []
+    for u, p in oa_urls:
+        if u not in seen:
+            seen.add(u); ordered.append((u, p))
+    for url, is_pdf in ordered[:4]:
+        result = await _fetch_and_extract(client, conn, doi, url, expect_pdf=is_pdf)
+        if result:
+            result.source = "openalex"
+            result.confidence = "medium"
+            return result
+    return None
+
+# --- Publisher-specific JATS XML builders ---
+def _plos_xml_url(doi: str) -> Optional[str]:
+    # PLOS exposes manuscript JATS via file?id=DOI
+    if not doi.startswith("10.1371/"):
+        return None
+    # Journal slug is inferred from the suffix; PLOS resolves any slug to the DOI
+    return f"https://journals.plos.org/plosone/article/file?id={doi}&type=manuscript"
+
+def _mdpi_xml_url(doi: str) -> Optional[str]:
+    # MDPI: DOI prefix 10.3390. They expose /xml and /pdf suffixes on article pages.
+    if not doi.startswith("10.3390/"):
+        return None
+    # MDPI DOIs look like 10.3390/journalYYYYXXX; the URL is /{journal-slug}/.../xml
+    # We fall back to the DOI resolver pattern:
+    # https://www.mdpi.com/{doi-suffix}/xml  works for many cases
+    suffix = doi.split("/", 1)[1]
+    return f"https://www.mdpi.com/resolver?DOI={quote(suffix)}"
+
+def _copernicus_xml_url(doi: str) -> Optional[str]:
+    # Copernicus (10.5194) has direct XML at journal-abbrev style URLs.
+    # Easier: use the landing-page meta tag fallback for Copernicus.
+    return None
+
+def _peerj_xml_url(doi: str) -> Optional[str]:
+    # PeerJ 10.7717/peerj.{NNNN}.xml
+    if not doi.startswith("10.7717/"):
+        return None
+    suffix = doi.split("/", 1)[1]
+    return f"https://peerj.com/articles/{suffix.split('peerj.',1)[-1]}.xml" if "peerj." in suffix else None
+
+async def t3_publisher_specific(client, conn, doi: str) -> Optional[Result]:
+    builders = [_plos_xml_url, _peerj_xml_url]
+    for build in builders:
+        url = build(doi)
+        if not url:
+            continue
+        cache_key = f"xml|{url}"
+        cached = cache_get(conn, "tier3", cache_key)
+        if cached:
+            status, ctype, body = cached
+        else:
+            try:
+                r = await fetch(client, url, accept="application/xml,text/xml,application/jats+xml")
+            except Exception:
+                cache_put(conn, "tier3", cache_key, 0, "", b"")
+                continue
+            status, ctype, body = r.status_code, r.headers.get("content-type",""), r.content
+            cache_put(conn, "tier3", cache_key, status, ctype, body)
+        if status == 200 and body and (b"<?xml" in body[:100] or b"<article" in body[:500]):
+            das_text = extract_das_from_jats(body)
+            if das_text:
+                return Result(
+                    doi=doi, has_das=True, das_text=das_text,
+                    data_identifiers=extract_identifiers(das_text, exclude_doi=doi),
+                    source="publisher_xml",
+                    confidence="high",
+                    retrieved_at=datetime.now(timezone.utc).isoformat(),
+                    notes=f"from {url}",
+                )
+    return None
+
+async def t3_landing_page_meta(client, conn, doi: str) -> Optional[Result]:
+    """Fetch the DOI resolver, parse <meta name="citation_*"> tags for
+    XML/PDF/HTML URLs, then extract DAS from the best of those."""
+    doi_url = f"https://doi.org/{quote(doi, safe='/')}"
+    cache_key = f"landing|{doi_url}"
+    cached = cache_get(conn, "tier3", cache_key)
+    if cached:
+        status, ctype, body = cached
+    else:
+        try:
+            r = await fetch(client, doi_url, accept="text/html")
+        except Exception:
+            cache_put(conn, "tier3", cache_key, 0, "", b"")
+            return None
+        status, ctype, body = r.status_code, r.headers.get("content-type",""), r.content
+        cache_put(conn, "tier3", cache_key, status, ctype, body)
+
+    if status != 200 or not body:
+        return None
+
+    # If the landing page itself is already HTML with a DAS, grab it.
+    das_text = extract_das_from_html(body)
+    if das_text:
+        return Result(
+            doi=doi, has_das=True, das_text=das_text,
+            data_identifiers=extract_identifiers(das_text, exclude_doi=doi),
+            source="landing_html",
+            confidence="medium",
+            retrieved_at=datetime.now(timezone.utc).isoformat(),
+            notes=f"from {doi_url}",
+        )
+
+    # Otherwise, extract meta-tag-linked content URLs
+    try:
+        soup = BeautifulSoup(body, "lxml")
+    except Exception:
+        soup = BeautifulSoup(body, "html.parser")
+    xml_urls, pdf_urls, html_urls = [], [], []
+    for meta in soup.find_all("meta"):
+        name = (meta.get("name") or meta.get("property") or "").lower()
+        content = meta.get("content")
+        if not content: continue
+        if name in ("citation_xml_url", "citation_fulltext_xml_url"):
+            xml_urls.append(content)
+        elif name == "citation_pdf_url":
+            pdf_urls.append(content)
+        elif name in ("citation_fulltext_html_url", "citation_abstract_html_url"):
+            html_urls.append(content)
+
+    for url in xml_urls[:2]:
+        result = await _fetch_and_extract(client, conn, doi, url, expect_pdf=False)
+        if result:
+            # Override type — this is XML
+            if b"<?xml" in await _get_cached_body(conn, url):
+                das_from_xml = extract_das_from_jats(await _get_cached_body(conn, url))
+                if das_from_xml:
+                    result.das_text = das_from_xml
+                    result.source = "landing_xml"
+                    result.confidence = "high"
+            return result
+    for url in html_urls[:2]:
+        result = await _fetch_and_extract(client, conn, doi, url, expect_pdf=False)
+        if result:
+            result.source = "landing_fulltext_html"
+            return result
+    for url in pdf_urls[:2]:
+        result = await _fetch_and_extract(client, conn, doi, url, expect_pdf=True)
+        if result:
+            result.source = "landing_pdf"
+            return result
+    return None
+
+async def _get_cached_body(conn, url: str) -> bytes:
+    row = conn.execute(
+        "SELECT body FROM http_cache WHERE tier='unpaywall' AND key IN (?, ?)",
+        (f"html|{url}", f"pdf|{url}"),
+    ).fetchone()
+    return row[0] if row else b""
 
 # ----------------------- identifier extraction -----------------------
 
@@ -617,7 +839,7 @@ async def process_doi(client, conn, doi: str, sem: asyncio.Semaphore) -> Result:
                 return r2
             # Deep mode
             if DEEP_SEARCH:
-                r3 = await tier3_publisher(client, conn, doi)
+                r3 = await tier3_deep(client, conn, doi)
                 if r3:
                     return r3
             # Return the best "no/partial" result we have
@@ -637,14 +859,26 @@ async def process_doi(client, conn, doi: str, sem: asyncio.Semaphore) -> Result:
             )
 
 async def main_async(args):
+    global DEEP_SEARCH
+    if args.deep:
+        DEEP_SEARCH = True
+
     all_pairs = load_dois(INPUT_FILE)
     print(f"[load] {len(all_pairs)} DOIs in {INPUT_FILE}")
 
-    size = args.sample if args.sample is not None else SAMPLE_SIZE
-    if args.all:
-        size = None
-    sample = stratified_sample(all_pairs, size, SAMPLE_SEED)
-    print(f"[sample] processing {len(sample)} DOIs (deep_search={DEEP_SEARCH})")
+    if args.retry_unknowns:
+        # Only process DOIs from previous CSV that weren't resolved
+        unresolved = _load_unresolved(args.retry_unknowns)
+        pair_by_doi = {d: p for p, d in all_pairs}
+        sample = [(pair_by_doi.get(d, ""), d) for d in unresolved if d in pair_by_doi]
+        print(f"[retry] {len(sample)} unresolved DOIs from {args.retry_unknowns} "
+              f"(deep_search={DEEP_SEARCH})")
+    else:
+        size = args.sample if args.sample is not None else SAMPLE_SIZE
+        if args.all:
+            size = None
+        sample = stratified_sample(all_pairs, size, SAMPLE_SEED)
+        print(f"[sample] processing {len(sample)} DOIs (deep_search={DEEP_SEARCH})")
 
     conn = init_cache(CACHE_DB)
     sem = asyncio.Semaphore(CONCURRENCY)
@@ -701,6 +935,18 @@ def summarize(results):
         print(f"    {s:<28} {c}")
     print("================================")
 
+def _load_unresolved(csv_path: Path) -> list:
+    """Return the list of DOIs in the given CSV whose has_das is not '1'."""
+    out = []
+    with csv_path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if (row.get("has_das") or "").strip() != "1":
+                doi = (row.get("doi") or "").strip()
+                if doi:
+                    out.append(doi)
+    return out
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sample", type=int, default=None,
@@ -709,6 +955,10 @@ def main():
                     help="process every DOI in the input file")
     ap.add_argument("--out", type=Path, default=None,
                     help="override output CSV path")
+    ap.add_argument("--deep", action="store_true",
+                    help="enable Tier 3 deep-search adapters")
+    ap.add_argument("--retry-unknowns", type=Path, default=None,
+                    help="path to a previous results CSV; re-process only rows where has_das != 1")
     args = ap.parse_args()
     asyncio.run(main_async(args))
 

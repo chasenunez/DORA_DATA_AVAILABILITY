@@ -197,3 +197,20 @@ Some things i found out along the way:
   humans, formatted by publishers, and rendered by websites in wildly
   inconsistent ways. The extractor is a compromise between recall and
   precision.
+- **PRELIMINARY RESULTS**
+  total:          71169
+  has_das=True:   1331  (1.9%)
+  with full text: 1331  (1.9%)
+  not found:      48095
+  errors:         0
+  by source:
+    none                         48095
+    europepmc_miss               21743
+    crossref_tdm                 1082
+    openalex                     185
+    unpaywall_html               30
+    landing_html                 14
+    landing_pdf                  12
+    europepmc_xml                4
+    landing_fulltext_html        3
+    unpaywall_pdf                1

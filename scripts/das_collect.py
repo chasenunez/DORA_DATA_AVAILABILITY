@@ -54,7 +54,7 @@ DEEP_SEARCH = False
 SAMPLE_SIZE = 200
 SAMPLE_SEED = 42
 
-CONCURRENCY      = 8       # global in-flight requests
+CONCURRENCY      = 16      # global in-flight requests
 REQUEST_TIMEOUT  = 30
 RETRIES          = 2
 USER_AGENT       = f"DORA-DAS-Collector/0.1 (mailto:{EMAIL})"
@@ -672,9 +672,29 @@ async def t3_publisher_specific(client, conn, doi: str) -> Optional[Result]:
                 )
     return None
 
+# Prefixes whose landing pages either need auth (paywall stubs) or 403 our
+# requests. We skip the slow DOI-resolver round trip for these.
+_LANDING_SKIP_PREFIXES = {
+    "10.1016",  # Elsevier ScienceDirect (403 / JS shell)
+    "10.1002",  # Wiley
+    "10.1021",  # ACS
+    "10.1103",  # APS
+    "10.1063",  # AIP
+    "10.1109",  # IEEE
+    "10.1107",  # IUCr
+    "10.1117",  # SPIE
+    "10.1080",  # T&F
+    "10.1088",  # IOP
+    "10.7566",  # JPS
+    "10.3233",  # IOS Press
+}
+
 async def t3_landing_page_meta(client, conn, doi: str) -> Optional[Result]:
     """Fetch the DOI resolver, parse <meta name="citation_*"> tags for
     XML/PDF/HTML URLs, then extract DAS from the best of those."""
+    prefix = doi.split("/", 1)[0]
+    if prefix in _LANDING_SKIP_PREFIXES:
+        return None
     doi_url = f"https://doi.org/{quote(doi, safe='/')}"
     cache_key = f"landing|{doi_url}"
     cached = cache_get(conn, "tier3", cache_key)
@@ -863,8 +883,9 @@ async def main_async(args):
     if args.deep:
         DEEP_SEARCH = True
 
-    all_pairs = load_dois(INPUT_FILE)
-    print(f"[load] {len(all_pairs)} DOIs in {INPUT_FILE}")
+    input_path = args.input or INPUT_FILE
+    all_pairs = load_dois(input_path)
+    print(f"[load] {len(all_pairs)} DOIs in {input_path}")
 
     if args.retry_unknowns:
         # Only process DOIs from previous CSV that weren't resolved
@@ -899,17 +920,25 @@ async def main_async(args):
 
     out_path = args.out or OUTPUT_CSV
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _safe(s):
+        """Strip lone surrogates and NULs that would break utf-8 csv writers."""
+        if not isinstance(s, str):
+            return s
+        # encode with surrogatepass then decode replacing invalids
+        return s.encode("utf-8", "replace").decode("utf-8", "replace").replace("\x00", "")
+
     with out_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["doi", "has_das", "das_text", "data_identifiers",
                     "source", "confidence", "retrieved_at", "notes"])
         for r in results:
             w.writerow([
-                r.doi,
+                _safe(r.doi),
                 "" if r.has_das is None else int(r.has_das),
-                r.das_text,
+                _safe(r.das_text),
                 json.dumps(r.data_identifiers, ensure_ascii=False) if r.data_identifiers else "",
-                r.source, r.confidence, r.retrieved_at, r.notes,
+                _safe(r.source), _safe(r.confidence), _safe(r.retrieved_at), _safe(r.notes),
             ])
     print(f"[write] {out_path}")
     summarize(results)
@@ -959,6 +988,8 @@ def main():
                     help="enable Tier 3 deep-search adapters")
     ap.add_argument("--retry-unknowns", type=Path, default=None,
                     help="path to a previous results CSV; re-process only rows where has_das != 1")
+    ap.add_argument("--input", type=Path, default=None,
+                    help="override INPUT_FILE (DOI list)")
     args = ap.parse_args()
     asyncio.run(main_async(args))
 

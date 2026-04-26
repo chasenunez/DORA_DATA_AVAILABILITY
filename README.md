@@ -1,6 +1,6 @@
 # DORA Data Availability
 
-A pipeline for reading scientific publications at scale and asking hoe many of the publications in DORA tell us where their data are.
+A pipeline for reading scientific publications at scale and asking how many of the publications in [DORA](https://www.dora.lib4ri.ch/) tell us where their data are.
 
 ## Why this exists
 
@@ -102,26 +102,37 @@ rejoining results to the institute's own records.
 
 ### Run it
 
-**Pilot** — 200 DOIs stratified by publisher, for a sanity check:
+**Pilot** — 200 DOIs stratified by publisher, for a sanity check.
+Writes to `DATA/das_pilot_results.csv` by default:
 
 ```bash
 python3 scripts/das_collect.py
 ```
 
-**Full run, default (fast) mode**:
+**Full run, default (fast) mode**. Use `nohup … &` so the run survives
+shell disconnection, and `python3 -u` so progress lines stream live to
+the log:
 
 ```bash
-nohup python3 scripts/das_collect.py --all \
+nohup python3 -u scripts/das_collect.py --all \
     --out DATA/das_results_pass1.csv \
     > DATA/pass1_run.log 2>&1 &
 ```
 
+On the Eawag corpus (~80k DOIs) this takes a few hours. Throughput
+depends mostly on PDF download latency.
+
 **Deep retry** over only the unresolved DOIs from Phase 1:
 
 ```bash
-python3 scripts/das_collect.py --retry-unknowns DATA/das_results_pass1.csv \
-    --deep --out DATA/das_results_pass2.csv
+nohup python3 -u scripts/das_collect.py \
+    --retry-unknowns DATA/das_results_pass1.csv \
+    --deep --out DATA/das_results_pass2.csv \
+    > DATA/pass2_run.log 2>&1 &
 ```
+
+Deep mode is meaningfully slower (extra adapters per DOI). Expect roughly
+half the throughput of Phase 1.
 
 **Merge** Phase 1 and Phase 2 into a single final CSV. For each DOI, Phase 2
 is preferred only when it successfully resolved a DAS:
@@ -131,6 +142,17 @@ python3 scripts/merge_results.py \
     DATA/das_results_pass1.csv \
     DATA/das_results_pass2.csv \
     --out DATA/das_results_final.csv
+```
+
+**Re-running on a subset.** If you ever need to re-process a specific
+subset of DOIs (for example, to recover a list of rows lost to a writer
+crash), pass `--input` to point at an alternate DOI list in the same
+pipe-delimited format as `DORA_DOIs.txt`:
+
+```bash
+python3 scripts/das_collect.py --all \
+    --input DATA/missing_dois.txt \
+    --out DATA/das_results_recovery.csv
 ```
 
 ### Monitoring a long run
@@ -151,6 +173,29 @@ ps -p <PID> -o pid,etime,stat,rss,pcpu
 If the process dies, you can just re-run the same command. Every HTTP response is
 cached in `DATA/das_cache.sqlite`, so previously-fetched DOIs resolve in
 milliseconds and only new work is done.
+
+**Important: only run one collector process at a time against a given
+output CSV.** Two processes writing to the same CSV will produce a
+corrupted file with NUL bytes interleaved through the rows. If you ever
+suspect a crash, check first with `ps aux | grep das_collect` before
+starting another.
+
+**Cache size.** The Unpaywall PDF cache can grow very large during a full
+run (tens of GB) because every fetched PDF is stored as a BLOB so that
+re-runs do not have to re-download. Once a phase completes, you can
+reclaim that space by stripping the large bodies and vacuuming:
+
+```bash
+python3 -c "
+import sqlite3
+c = sqlite3.connect('DATA/das_cache.sqlite')
+c.execute(\"UPDATE http_cache SET body=x'' WHERE tier='unpaywall' AND length(body) > 100000\")
+c.commit()
+c.execute('VACUUM')"
+```
+
+This preserves the row metadata (so future runs still skip the URL) but
+drops the bytes themselves.
 
 ## Output schema
 
@@ -181,7 +226,7 @@ analysis over the output CSVs. A typical workflow:
    needed).
 
 
-Some things i found out along the way:
+## Some things I found out along the way
 
 - **Not every paper can be read.** A substantial fraction of the 4RI
   output sits in paywalled journals where the full text is not legally
@@ -191,26 +236,55 @@ Some things i found out along the way:
 - **"No DAS found" is not the same as "no data shared."** Some disciplines
   have a long tradition of depositing data in community archives without
   ever writing a dedicated DAS (crystallography at the CCDC, for example).
-  A zero in `has_das` smeans "no statement we could find in the
-  article"
+  A zero in `has_das` means "no statement we could find in the
+  article."
 - **The tool is heuristic.** Data availability sections are written by
   humans, formatted by publishers, and rendered by websites in wildly
   inconsistent ways. The extractor is a compromise between recall and
   precision.
-- **PRELIMINARY RESULTS**
-  total:          71169
-  has_das=True:   1331  (1.9%)
-  with full text: 1331  (1.9%)
-  not found:      48095
-  errors:         0
-  by source:
-    none                         48095
-    europepmc_miss               21743
-    crossref_tdm                 1082
-    openalex                     185
-    unpaywall_html               30
-    landing_html                 14
-    landing_pdf                  12
-    europepmc_xml                4
-    landing_fulltext_html        3
-    unpaywall_pdf                1
+
+## Results from the first full run (Eawag, ~80k DOIs)
+
+The pipeline was first exercised against the full Eawag publication list
+(79,610 unique DOIs after deduplication). Phase 1 ran in default mode;
+Phase 2 then re-tried the unresolved DOIs with `--deep` and the merged
+output is in `DATA/das_results_final.csv`.
+
+**Headline:** **9,772 papers (12.27%)** carry a recoverable data
+availability statement. Of those, **3,175 statements** explicitly point
+to one or more datasets via DOI, repository URL, or accession number.
+
+**Where the recovered statements came from:**
+
+| source | rows | notes |
+|---|---:|---|
+| `europepmc_xml` | 5,257 | structured JATS XML — highest confidence |
+| `unpaywall_pdf` | 2,051 | open-access PDF, parsed with pypdf |
+| `unpaywall_html` | 1,168 | open-access HTML landing page |
+| `crossref_tdm` | 1,082 | full text via Crossref text-mining links |
+| `openalex` | 185 | additional OA URLs from OpenAlex |
+| `landing_html` / `landing_pdf` / `landing_fulltext_html` | 29 | parsed from publisher landing pages |
+| **total `has_das = 1`** | **9,772** | **12.27% of the corpus** |
+
+**What didn't yield a statement:**
+
+| outcome | rows | meaning |
+|---|---:|---|
+| `none` | 48,008 | not findable — paper not indexed by Europe PMC and no usable open-access copy from Unpaywall |
+| `europepmc_miss` | 21,688 | Europe PMC has the paper but no DAS appears in its full-text XML (often a pre-2016 article) |
+| `error` | 142 | network or parsing failure |
+
+A few takeaways:
+
+- The Phase 2 deep search added 1,331 papers on top of Phase 1 — small
+  in absolute terms, but noteworthy because it reaches papers that no
+  conventional source had indexed. Crossref TDM links were the single
+  biggest source of Phase 2 hits.
+- About 60% of the corpus is in journals Europe PMC does not index —
+  largely physical sciences (chemistry, materials, hydrology, physics).
+  These are not life-sciences papers, so the absence is structural,
+  not a coverage failure.
+- Around a quarter of the corpus pre-dates the era when data
+  availability statements were common. A `has_das = 0` from a 2008
+  paper means something different than a `has_das = 0` from a 2024 one.
+  Year-stratified analysis is recommended.

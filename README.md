@@ -4,7 +4,7 @@ A pipeline for reading scientific publications at scale and asking how many of t
 
 ## Why this exists
 
-Whether a paper has a DAS, and what that statement actually says, is one of
+Whether a paper has a data availability statement (DAS), and what that statement actually says, is one of
 the cleanest signals we have for how open a piece of research really is. It
 tells us whether the underlying evidence is inspectable, reusable, and
 reproducible. 

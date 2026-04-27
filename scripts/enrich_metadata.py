@@ -23,6 +23,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict, Optional
 from urllib.parse import quote
 
 import httpx
@@ -75,7 +76,7 @@ async def fetch(client, url):
     return None
 
 
-async def crossref_for(client, conn, doi: str) -> dict | None:
+async def crossref_for(client, conn, doi: str) -> Optional[dict]:
     key = f"crossref|{doi}"
     row = cache_get(conn, key)
     if row:
@@ -103,7 +104,7 @@ async def crossref_for(client, conn, doi: str) -> dict | None:
     return data
 
 
-def extract_metadata(crossref_json: dict | None) -> dict:
+def extract_metadata(crossref_json: Optional[dict]) -> dict:
     """Pull year, journal, ISSN, publisher, work type from a Crossref payload."""
     out = {f: "" for f in ENRICH_FIELDS}
     if not crossref_json:
@@ -173,7 +174,7 @@ async def main_async(args):
     fetched = 0
     cached_hits = 0
     none_hits = 0
-    enrich_by_doi: dict[str, dict] = {}
+    enrich_by_doi: Dict[str, dict] = {}
 
     async def work(doi):
         nonlocal fetched, cached_hits, none_hits

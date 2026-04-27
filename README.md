@@ -245,7 +245,7 @@ analysis over the output CSVs. A typical workflow:
 
 ## Results from the first full run (Eawag, ~80k DOIs)
 
-The pipeline was first exercised against the full Eawag publication list
+The pipeline was first exercised against the full DORA publication list
 (79,610 unique DOIs after deduplication). Phase 1 ran in default mode;
 Phase 2 then re-tried the unresolved DOIs with `--deep` and the merged
 output is in `DATA/das_results_final.csv`.

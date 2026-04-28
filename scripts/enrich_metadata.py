@@ -28,7 +28,6 @@ from urllib.parse import quote
 
 import httpx
 
-# ============================ CONFIG =================================
 EMAIL = "chase.nunez@lib4ri.ch"
 CACHE_DB = Path("DATA/das_cache.sqlite")
 CROSSREF = "https://api.crossref.org/works/{doi}"
@@ -36,7 +35,6 @@ CONCURRENCY = 12
 REQUEST_TIMEOUT = 30
 RETRIES = 2
 USER_AGENT = f"DORA-DAS-Collector/0.1 (mailto:{EMAIL})"
-# =====================================================================
 
 ENRICH_FIELDS = ["year", "journal", "issn", "publisher", "work_type"]
 
@@ -84,7 +82,7 @@ async def crossref_for(client, conn, doi: str) -> Optional[dict]:
         if status == 200 and body:
             try:
                 return json.loads(body)
-            except Exception:
+            except (json.JSONDecodeError, ValueError):
                 return None
         return None
 
@@ -97,7 +95,7 @@ async def crossref_for(client, conn, doi: str) -> Optional[dict]:
         return None
     try:
         data = r.json()
-    except Exception:
+    except (json.JSONDecodeError, ValueError):
         cache_put(conn, key, r.status_code, b"")
         return None
     cache_put(conn, key, 200, json.dumps(data).encode("utf-8"))

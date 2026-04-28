@@ -40,7 +40,6 @@ try:
 except ImportError:
     _HAS_PDF = False
 
-# =============================== CONFIG ===============================
 EMAIL = "chase.nunez@lib4ri.ch"
 
 INPUT_FILE  = Path("DATA/DORA_DOIs.txt")
@@ -58,13 +57,11 @@ CONCURRENCY      = 16      # global in-flight requests
 REQUEST_TIMEOUT  = 30
 RETRIES          = 2
 USER_AGENT       = f"DORA-DAS-Collector/0.1 (mailto:{EMAIL})"
-# ======================================================================
 
 EUROPEPMC_SEARCH = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 EUROPEPMC_FULLTEXT = "https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
 UNPAYWALL = "https://api.unpaywall.org/v2/{doi}"
 
-# ------------------------------ regexes -------------------------------
 
 # Case-insensitive DOI match. We strip trailing punctuation.
 DOI_IN_TEXT_RE = re.compile(r'10\.\d{4,9}/[-._;()/:A-Za-z0-9]+', re.IGNORECASE)
@@ -111,7 +108,6 @@ JATS_DAS_SEC_TYPES = {
 }
 JATS_DAS_NOTES_TYPES = {"data-availability", "data-access", "data-sharing"}
 
-# --------------------------- data structures --------------------------
 
 @dataclass
 class Result:
@@ -124,7 +120,6 @@ class Result:
     retrieved_at: str = ""
     notes: str = ""
 
-# ----------------------------- cache layer ----------------------------
 
 def init_cache(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,7 +152,6 @@ def cache_put(conn, tier: str, key: str, status: int, content_type: str, body: b
     )
     conn.commit()
 
-# ---------------------------- HTTP helpers ----------------------------
 
 async def fetch(client: httpx.AsyncClient, url: str, *, params=None, headers=None, accept=None) -> httpx.Response:
     hdrs = {"User-Agent": USER_AGENT}
@@ -182,7 +176,6 @@ async def fetch(client: httpx.AsyncClient, url: str, *, params=None, headers=Non
         raise last_exc
     raise RuntimeError("unreachable")
 
-# ------------------------- Tier 1: Europe PMC -------------------------
 
 async def tier1_europepmc(client: httpx.AsyncClient, conn, doi: str) -> Optional[Result]:
     """Look up DOI in Europe PMC; fetch fullTextXML if OA; extract DAS from JATS."""
@@ -340,7 +333,6 @@ def _text_of(el) -> str:
     txt = " ".join(pieces)
     return re.sub(r'\s+', ' ', txt).strip()
 
-# -------------------------- Tier 2: Unpaywall -------------------------
 
 async def tier2_unpaywall_html(client: httpx.AsyncClient, conn, doi: str) -> Optional[Result]:
     cache_key = f"unpaywall|{doi}"
@@ -395,7 +387,7 @@ async def _fetch_and_extract(client, conn, doi: str, url: str, *, expect_pdf: bo
         try:
             accept = "application/pdf" if expect_pdf else "text/html,application/xml;q=0.9"
             r = await fetch(client, url, accept=accept)
-        except Exception:
+        except (httpx.RequestError, RuntimeError):
             cache_put(conn, "unpaywall", cache_key, 0, "", b"")
             return None
         status, ctype, body = r.status_code, r.headers.get("content-type", ""), r.content
@@ -430,14 +422,14 @@ async def _fetch_and_extract(client, conn, doi: str, url: str, *, expect_pdf: bo
 def extract_das_from_pdf(body: bytes) -> str:
     try:
         reader = PdfReader(io.BytesIO(body))
-    except Exception:
+    except Exception:  # pypdf raises a variety of unparseable-PDF errors
         return ""
     # Concatenate all pages' text
     pages = []
     for p in reader.pages:
         try:
             pages.append(p.extract_text() or "")
-        except Exception:
+        except Exception:  # pypdf extract_text can fail on individual pages
             continue
     text = "\n".join(pages)
     return extract_das_from_plaintext(text)
@@ -473,7 +465,7 @@ def extract_das_from_html(body: bytes) -> str:
     until the next heading or section boundary."""
     try:
         soup = BeautifulSoup(body, "lxml")
-    except Exception:
+    except (FeatureNotFound, ImportError):
         soup = BeautifulSoup(body, "html.parser")
 
     # Pass 1: look for elements with a DAS-ish id/class
@@ -512,10 +504,7 @@ def extract_das_from_html(body: bytes) -> str:
             return _clean_html_text(sec)
 
     # Pass 4: flatten to plaintext and scan for DAS heading
-    try:
-        flat = soup.get_text("\n", strip=True)
-    except Exception:
-        flat = ""
+    flat = soup.get_text("\n", strip=True)
     if flat:
         das = extract_das_from_plaintext(flat)
         if das and len(das) > 20:
@@ -527,7 +516,6 @@ def _clean_html_text(el) -> str:
     txt = el.get_text(" ", strip=True)
     return re.sub(r'\s+', ' ', txt).strip()
 
-# -------------------- Tier 3: publisher-specific ----------------------
 # Off by default. When DEEP_SEARCH=True, tries Crossref TDM, OpenAlex,
 # publisher-specific JATS-XML endpoints, and landing-page meta tag parsing.
 
@@ -542,7 +530,7 @@ async def tier3_deep(client: httpx.AsyncClient, conn, doi: str) -> Optional[Resu
             r = await adapter(client, conn, doi)
             if r and r.has_das and r.das_text:
                 return r
-        except Exception:
+        except (httpx.RequestError, RuntimeError, ValueError):
             continue
     return None
 
@@ -611,7 +599,6 @@ async def t3_openalex(client, conn, doi: str) -> Optional[Result]:
             return result
     return None
 
-# --- Publisher-specific JATS XML builders ---
 def _plos_xml_url(doi: str) -> Optional[str]:
     # PLOS exposes manuscript JATS via file?id=DOI
     if not doi.startswith("10.1371/"):
@@ -654,7 +641,7 @@ async def t3_publisher_specific(client, conn, doi: str) -> Optional[Result]:
         else:
             try:
                 r = await fetch(client, url, accept="application/xml,text/xml,application/jats+xml")
-            except Exception:
+            except (httpx.RequestError, RuntimeError):
                 cache_put(conn, "tier3", cache_key, 0, "", b"")
                 continue
             status, ctype, body = r.status_code, r.headers.get("content-type",""), r.content
@@ -703,7 +690,7 @@ async def t3_landing_page_meta(client, conn, doi: str) -> Optional[Result]:
     else:
         try:
             r = await fetch(client, doi_url, accept="text/html")
-        except Exception:
+        except (httpx.RequestError, RuntimeError):
             cache_put(conn, "tier3", cache_key, 0, "", b"")
             return None
         status, ctype, body = r.status_code, r.headers.get("content-type",""), r.content
@@ -727,7 +714,7 @@ async def t3_landing_page_meta(client, conn, doi: str) -> Optional[Result]:
     # Otherwise, extract meta-tag-linked content URLs
     try:
         soup = BeautifulSoup(body, "lxml")
-    except Exception:
+    except (FeatureNotFound, ImportError):
         soup = BeautifulSoup(body, "html.parser")
     xml_urls, pdf_urls, html_urls = [], [], []
     for meta in soup.find_all("meta"):
@@ -771,7 +758,6 @@ async def _get_cached_body(conn, url: str) -> bytes:
     ).fetchone()
     return row[0] if row else b""
 
-# ----------------------- identifier extraction -----------------------
 
 def extract_identifiers(text: str, *, exclude_doi: str = "") -> list:
     if not text:
@@ -810,7 +796,6 @@ def extract_identifiers(text: str, *, exclude_doi: str = "") -> list:
 
     return found
 
-# ------------------------------ runner --------------------------------
 
 def load_dois(path: Path) -> list:
     pairs = []
@@ -871,7 +856,7 @@ async def process_doi(client, conn, doi: str, sem: asyncio.Semaphore) -> Result:
                 retrieved_at=datetime.now(timezone.utc).isoformat(),
                 notes="not found in epmc or unpaywall",
             )
-        except Exception as e:
+        except Exception as e:  # outermost per-DOI catch-all; surface as a row, don't crash the run
             return Result(
                 doi=doi, has_das=None, source="error",
                 retrieved_at=datetime.now(timezone.utc).isoformat(),

@@ -21,9 +21,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
 
-# ---------------------------------------------------------------------------
 # Style: restrained, sans-serif, no chart-junk. Single accent palette.
-# ---------------------------------------------------------------------------
 
 PALETTE = {
     "primary":  "#2E5077",   # deep blue   - "yes / found"
@@ -56,10 +54,8 @@ def apply_style():
         "savefig.facecolor": "white",
     })
 
-# ---------------------------------------------------------------------------
 # Publisher mapping (DOI prefix -> publisher name). Anything unmapped is
 # bucketed as "Other" for top-N charts.
-# ---------------------------------------------------------------------------
 
 PUBLISHER_MAP = {
     "10.1016": "Elsevier",
@@ -105,9 +101,7 @@ def publisher_of(doi: str) -> str:
     prefix = doi.split("/", 1)[0]
     return PUBLISHER_MAP.get(prefix, "Other")
 
-# ---------------------------------------------------------------------------
 # Load and aggregate
-# ---------------------------------------------------------------------------
 
 def load(path: Path) -> list:
     rows = []
@@ -121,12 +115,10 @@ def parse_ids(s: str) -> list:
         return []
     try:
         return json.loads(s)
-    except Exception:
+    except json.JSONDecodeError:
         return []
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 def _annotate_pie(ax, total, title, subtitle=None):
     ax.set_title(title, pad=14)
@@ -143,9 +135,7 @@ def _autopct(values):
         return f"{p:.1f}%\n({n:,})"
     return fmt
 
-# ---------------------------------------------------------------------------
 # Figure 1: top-level outcomes (donut)
-# ---------------------------------------------------------------------------
 
 def fig_outcomes(rows, out_path: Path):
     has_das       = sum(1 for r in rows if r["has_das"] == "1")
@@ -188,9 +178,7 @@ def fig_outcomes(rows, out_path: Path):
     plt.close(fig)
     print(f"  wrote {out_path}")
 
-# ---------------------------------------------------------------------------
 # Figure 2: where the DAS came from (horizontal bar)
-# ---------------------------------------------------------------------------
 
 SOURCE_LABELS = {
     "europepmc_xml":         "Europe PMC (structured XML)",
@@ -257,9 +245,7 @@ def fig_sources(rows, out_path: Path):
     plt.close(fig)
     print(f"  wrote {out_path}")
 
-# ---------------------------------------------------------------------------
 # Figure 3: DAS rate by publisher (stacked bar, top-N by paper count)
-# ---------------------------------------------------------------------------
 
 def fig_by_publisher(rows, out_path: Path, top_n: int = 12, min_papers: int = 100):
     by_pub = Counter()
@@ -309,9 +295,7 @@ def fig_by_publisher(rows, out_path: Path, top_n: int = 12, min_papers: int = 10
     plt.close(fig)
     print(f"  wrote {out_path}")
 
-# ---------------------------------------------------------------------------
 # Figure 4: among DAS papers, concrete vs vague (donut)
-# ---------------------------------------------------------------------------
 
 # Words that flag a "vague" or "non-actionable" DAS, when no identifiers found
 VAGUE_PATTERNS = re.compile(
@@ -365,9 +349,7 @@ def fig_specificity(rows, out_path: Path):
     plt.close(fig)
     print(f"  wrote {out_path}")
 
-# ---------------------------------------------------------------------------
 # Figure 5: types of dataset identifiers found (horizontal bar)
-# ---------------------------------------------------------------------------
 
 # Group repository URLs into a coarser bucket name
 URL_HOST_BUCKET = [
@@ -442,9 +424,7 @@ def fig_identifier_types(rows, out_path: Path, top_n: int = 12):
     plt.close(fig)
     print(f"  wrote {out_path}")
 
-# ---------------------------------------------------------------------------
 # Driver
-# ---------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()

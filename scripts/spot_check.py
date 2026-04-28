@@ -61,7 +61,7 @@ def parse_ids(s: str) -> list:
         return []
     try:
         return json.loads(s)
-    except Exception:
+    except json.JSONDecodeError:
         return []
 
 
